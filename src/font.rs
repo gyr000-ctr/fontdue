@@ -2,13 +2,14 @@ use crate::layout::GlyphRasterConfig;
 use crate::math::{Geometry, Line};
 use crate::platform::{as_i32, ceil, floor, fract, is_negative};
 use crate::raster::Raster;
-use crate::table::{load_gsub, TableKern};
+use crate::table::{load_gsub, KernLookup, TableGpos, TableKern};
 use crate::unicode;
 use crate::FontResult;
 use crate::{HashMap, HashSet};
 use alloc::string::String;
 use alloc::vec;
 use alloc::vec::*;
+use core::cell::RefCell;
 use core::hash::{Hash, Hasher};
 use core::mem;
 use core::num::NonZeroU16;
@@ -193,6 +194,10 @@ pub struct Font {
     char_to_glyph: HashMap<char, NonZeroU16>,
     horizontal_line_metrics: Option<LineMetrics>,
     horizontal_kern: Option<HashMap<u32, i16>>,
+    gpos: Option<TableGpos>,
+    /// Lazily populated per-pair GPOS kerning results. Pairs are resolved on
+    /// demand and cached here; the GPOS table is never expanded in full.
+    gpos_kern_cache: RefCell<HashMap<u32, Option<i16>>>,
     vertical_line_metrics: Option<LineMetrics>,
     settings: FontSettings,
     hash: usize,
@@ -254,6 +259,17 @@ impl Font {
             let table: TableKern = TableKern::new(table)?;
             Some(table.horizontal_mappings)
         })();
+
+        // Fall back to GPOS pair positioning for kerning only when the font
+        // has no legacy kern table, so fonts with a kern table are unaffected.
+        let gpos: Option<TableGpos> = if horizontal_kern.is_none() {
+            (|| {
+                let table: &[u8] = face.raw_face().table(Tag::from_bytes(&b"GPOS"))?;
+                TableGpos::new(table)
+            })()
+        } else {
+            None
+        };
 
         // Collect all the unique codepoint to glyph mappings.
         let glyph_count = face.number_of_glyphs();
@@ -342,6 +358,8 @@ impl Font {
             units_per_em,
             horizontal_line_metrics,
             horizontal_kern,
+            gpos,
+            gpos_kern_cache: RefCell::new(HashMap::new()),
             vertical_line_metrics,
             settings,
             hash,
@@ -433,10 +451,32 @@ impl Font {
     #[inline(always)]
     pub fn horizontal_kern_indexed(&self, left: u16, right: u16, px: f32) -> Option<f32> {
         let scale = self.scale_factor(px);
-        let map = self.horizontal_kern.as_ref()?;
+        if let Some(map) = self.horizontal_kern.as_ref() {
+            let key = u32::from(left) << 16 | u32::from(right);
+            let value = map.get(&key)?;
+            return Some((*value as f32) * scale);
+        }
+        let value = self.gpos_kern_indexed(left, right)?;
+        Some((value as f32) * scale)
+    }
+
+    /// Retrieves the unscaled GPOS kerning value for two adjacent glyph
+    /// indices, resolving and caching pairs on demand.
+    fn gpos_kern_indexed(&self, left: u16, right: u16) -> Option<i16> {
+        let gpos = self.gpos.as_ref()?;
         let key = u32::from(left) << 16 | u32::from(right);
-        let value = map.get(&key)?;
-        Some((*value as f32) * scale)
+        if let Some(value) = self.gpos_kern_cache.borrow().get(&key) {
+            return *value;
+        }
+        let value = match gpos.kern(left, right, self.glyph_count()) {
+            KernLookup::Value(value) => Some(value),
+            KernLookup::NoKerning => None,
+            // Not cached: these describe the font structure or caller error,
+            // not pair data.
+            KernLookup::UnsupportedFormat | KernLookup::GlyphOutOfBounds => return None,
+        };
+        self.gpos_kern_cache.borrow_mut().insert(key, value);
+        value
     }
 
     /// Retrieves the layout metrics for the given character. If the character isn't present in the
@@ -642,5 +682,137 @@ impl Font {
     /// Gets the total glyphs in the font.
     pub fn glyph_count(&self) -> u16 {
         self.glyphs.len() as u16
+    }
+}
+
+#[cfg(test)]
+mod gpos_kerning_tests {
+    use crate::table::KernLookup;
+    use crate::{Font, FontSettings};
+
+    static ROBOTO: &[u8] = include_bytes!("../dev/resources/fonts/Roboto-Regular.ttf");
+    static COMFORTAA: &[u8] = include_bytes!("../dev/resources/fonts/Comfortaa-Regular.ttf");
+    static FASTER_ONE: &[u8] = include_bytes!("../dev/resources/fonts/FasterOne-Regular.ttf");
+    static GREAT_VIBES: &[u8] = include_bytes!("../dev/resources/fonts/GreatVibes-Regular.otf");
+    static INCONSOLATA: &[u8] = include_bytes!("../dev/resources/fonts/Inconsolata-Regular.ttf");
+    static MODERN_PICS: &[u8] = include_bytes!("../dev/resources/fonts/modernpics.otf");
+    static ROBOTO_MONO: &[u8] = include_bytes!("../dev/resources/fonts/RobotoMono-Regular.ttf");
+
+    fn font(data: &[u8]) -> Font {
+        Font::from_bytes(data, FontSettings::default()).unwrap()
+    }
+
+    // GreatVibes is the only bundled font with a legacy kern table. Its
+    // kerning results must stay bit-identical to the legacy path.
+    #[test]
+    fn gpos_kerning_legacy_kern_table_bit_identical() {
+        let font = font(GREAT_VIBES);
+        // The legacy kern table takes priority; GPOS is not consulted.
+        assert!(font.horizontal_kern.is_some());
+        assert!(font.gpos.is_none());
+        let scale = 40.0 / 1000.0; // units_per_em is 1000
+        assert_eq!(font.horizontal_kern('P', 'a', 40.0), Some(-54.0 * scale));
+        assert_eq!(font.horizontal_kern('T', 'U', 40.0), Some(205.0 * scale));
+        assert_eq!(font.horizontal_kern('u', 's', 40.0), Some(-1.0 * scale));
+        assert_eq!(font.horizontal_kern('F', 'i', 40.0), Some(75.0 * scale));
+        assert_eq!(font.horizontal_kern('A', 'A', 40.0), None);
+        assert_eq!(font.horizontal_kern('G', 'r', 40.0), None);
+    }
+
+    // Fonts without a kern table resolve kerning through GPOS pair
+    // positioning. Expected values were verified against the fonts' GPOS
+    // tables.
+    #[test]
+    fn gpos_kerning_gpos_pairs() {
+        let roboto = font(ROBOTO); // units_per_em is 2048
+        assert!(roboto.horizontal_kern.is_none());
+        assert!(roboto.gpos.is_some());
+        let scale = 40.0 / 2048.0;
+        assert_eq!(roboto.horizontal_kern('A', 'V', 40.0), Some(-87.0 * scale));
+        assert_eq!(roboto.horizontal_kern('T', 'o', 40.0), Some(-99.0 * scale));
+        assert_eq!(roboto.horizontal_kern('W', 'a', 40.0), Some(-33.0 * scale));
+        assert_eq!(roboto.horizontal_kern('Y', 'o', 40.0), Some(-65.0 * scale));
+        // A class pair with a zero adjustment.
+        assert_eq!(roboto.horizontal_kern('A', 'A', 40.0), Some(0.0));
+        // A pair with no kerning data.
+        assert_eq!(roboto.horizontal_kern('f', 'i', 40.0), None);
+
+        let comfortaa = font(COMFORTAA); // units_per_em is 1000
+        let scale = 40.0 / 1000.0;
+        assert_eq!(comfortaa.horizontal_kern('A', 'V', 40.0), Some(-80.0 * scale));
+        assert_eq!(comfortaa.horizontal_kern('T', 'o', 40.0), Some(-150.0 * scale));
+        assert_eq!(comfortaa.horizontal_kern('Y', 'a', 40.0), Some(-100.0 * scale));
+
+        let faster_one = font(FASTER_ONE); // units_per_em is 1000
+        assert_eq!(faster_one.horizontal_kern('A', 'V', 40.0), Some(-20.0 * scale));
+        assert_eq!(faster_one.horizontal_kern('T', 'o', 40.0), Some(-50.0 * scale));
+    }
+
+    // The char and indexed entry points resolve through the same path.
+    #[test]
+    fn gpos_kerning_indexed_matches_char() {
+        let font = font(ROBOTO);
+        let (t, o) = (font.lookup_glyph_index('T'), font.lookup_glyph_index('o'));
+        assert_eq!(font.horizontal_kern('T', 'o', 32.0), font.horizontal_kern_indexed(t, o, 32.0));
+        assert_eq!(font.horizontal_kern_indexed(t, o, 32.0), Some(-99.0 * (32.0 / 2048.0)));
+    }
+
+    // The cache is populated on demand, one pair at a time, and never
+    // expands the whole GPOS table.
+    #[test]
+    fn gpos_kerning_cache_on_demand() {
+        let font = font(ROBOTO);
+        assert_eq!(font.gpos_kern_cache.borrow().len(), 0);
+        font.horizontal_kern('A', 'V', 40.0);
+        assert_eq!(font.gpos_kern_cache.borrow().len(), 1);
+        // A repeat query hits the cache.
+        font.horizontal_kern('A', 'V', 40.0);
+        assert_eq!(font.gpos_kern_cache.borrow().len(), 1);
+        // Misses are cached too.
+        font.horizontal_kern('f', 'i', 40.0);
+        assert_eq!(font.gpos_kern_cache.borrow().len(), 2);
+        font.horizontal_kern('T', 'o', 40.0);
+        font.horizontal_kern('W', 'a', 40.0);
+        font.horizontal_kern('Y', 'o', 40.0);
+        // A handful of queries stays a handful of entries; Roboto's GPOS
+        // kerning covers thousands of class pairs.
+        assert!(font.gpos_kern_cache.borrow().len() < 10);
+    }
+
+    // No kerning, unsupported data, and out of bounds glyphs are
+    // distinguishable outcomes.
+    #[test]
+    fn gpos_kerning_lookup_outcomes() {
+        let font = font(ROBOTO);
+        let glyph_count = font.glyph_count();
+        let gpos = font.gpos.as_ref().unwrap();
+        let (a, v) = (font.lookup_glyph_index('A'), font.lookup_glyph_index('V'));
+        let (f, i) = (font.lookup_glyph_index('f'), font.lookup_glyph_index('i'));
+        assert_eq!(gpos.kern(a, v, glyph_count), KernLookup::Value(-87));
+        assert_eq!(gpos.kern(f, i, glyph_count), KernLookup::NoKerning);
+        assert_eq!(gpos.kern(glyph_count, v, glyph_count), KernLookup::GlyphOutOfBounds);
+        assert_eq!(gpos.kern(a, glyph_count, glyph_count), KernLookup::GlyphOutOfBounds);
+        // Out of bounds queries surface as None and aren't cached.
+        let cached = font.gpos_kern_cache.borrow().len();
+        assert_eq!(font.horizontal_kern_indexed(glyph_count, v, 40.0), None);
+        assert_eq!(font.horizontal_kern_indexed(a, glyph_count, 40.0), None);
+        assert_eq!(font.gpos_kern_cache.borrow().len(), cached);
+    }
+
+    // Fonts with no kerning data at all keep returning None.
+    #[test]
+    fn gpos_kerning_no_kerning_fonts() {
+        // RobotoMono has neither a kern table nor a GPOS table.
+        let roboto_mono = font(ROBOTO_MONO);
+        assert!(roboto_mono.gpos.is_none());
+        assert_eq!(roboto_mono.horizontal_kern('A', 'V', 40.0), None);
+        // modernpics has neither as well.
+        let modern_pics = font(MODERN_PICS);
+        assert!(modern_pics.gpos.is_none());
+        assert_eq!(modern_pics.horizontal_kern('A', 'V', 40.0), None);
+        // Inconsolata has a GPOS table, but no kern feature in it.
+        let inconsolata = font(INCONSOLATA);
+        assert!(inconsolata.gpos.is_none());
+        assert_eq!(inconsolata.horizontal_kern('A', 'V', 40.0), None);
     }
 }
