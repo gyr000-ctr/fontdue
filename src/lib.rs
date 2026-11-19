@@ -10,6 +10,7 @@
 
 extern crate alloc;
 
+mod fallback;
 mod font;
 mod hash;
 /// Tools for laying out strings of text.
@@ -20,6 +21,7 @@ mod raster;
 mod table;
 mod unicode;
 
+pub use crate::fallback::*;
 pub use crate::font::*;
 
 #[cfg(feature = "hashbrown")]

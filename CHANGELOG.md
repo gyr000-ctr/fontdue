@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+### Added
+- Cross-font fallback support in the new `fallback` module:
+  - `covers()` cmap coverage query and `resolve_char()` per-character chain resolution.
+  - `GraphemeClusters` iterator plus `resolve_cluster()`/`resolve_clusters()` for
+    per-grapheme-cluster font selection (combining marks and ZWJ sequences stay in one font).
+  - `FallbackStatus`/`ClusterStatus` distinguish resolved, fully-missing and empty-cluster
+    outcomes; font parse failures remain separate `FontResult` errors.
+  - `load_font_chain()` helper for building an owned ordered chain.
+  - `Layout::append_fallback()` lays text out across a borrowed font chain, switching fonts per
+    cluster and mixing line metrics. Single-font chains produce output bit-identical to
+    `Layout::append()`; fonts are borrowed and never table-copied.
+
 ## [0.9.5] - 2026-10-18
 ### Fixed
 - deprecated core::f32::MAX/MIN usage replaced with f32::MAX/MIN
