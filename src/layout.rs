@@ -6,9 +6,11 @@ use crate::{
     platform::{ceil, floor},
     Metrics,
 };
+use alloc::vec;
 use alloc::vec::*;
 use core::borrow::Borrow;
 use core::hash::{Hash, Hasher};
+use core::ops::Range;
 
 /// Horizontal alignment options for text when a max_width is provided.
 #[derive(Copy, Clone, PartialEq)]
@@ -159,6 +161,192 @@ pub struct GlyphPosition<U: Copy + Clone = ()> {
     pub char_data: CharacterData,
     /// Custom user data associated with the text styled used to generate this glyph.
     pub user_data: U,
+}
+
+/// Errors that can occur while applying GSUB glyph substitutions during layout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayoutError {
+    /// The font requires a GSUB lookup type that this engine does not implement. Contains the
+    /// OpenType GSUB lookup type number (e.g. 6 for chaining contextual substitution).
+    UnsupportedLookup(u16),
+    /// Substitutions chained beyond the maximum supported depth. This indicates a recursive
+    /// substitution cycle in the font's GSUB table.
+    RecursiveSubstitution,
+}
+
+impl core::fmt::Display for LayoutError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            LayoutError::UnsupportedLookup(kind) => {
+                write!(f, "unsupported GSUB lookup type: {}", kind)
+            }
+            LayoutError::RecursiveSubstitution => {
+                write!(f, "recursive GSUB substitution detected")
+            }
+        }
+    }
+}
+
+/// A glyph produced by GSUB-aware layout, mapped back to the source text.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LayoutGlyph {
+    /// The index of the glyph in the font after all substitutions have been applied.
+    pub glyph_index: u16,
+    /// The byte range in the original string that this glyph was produced from. Ranges of
+    /// consecutive glyphs are continuous and never overlap. Glyphs produced by a one-to-many
+    /// (multiple) substitution after the first cover an empty range at the boundary of the
+    /// substituted source range.
+    pub byte_range: Range<usize>,
+}
+
+/// A parsed GSUB lookup in an owned form that the layout engine can apply.
+#[derive(Debug, Clone)]
+pub(crate) enum GsubLookup {
+    /// One-to-one substitution, sorted by input glyph index.
+    Single(Vec<(u16, u16)>),
+    /// One-to-many substitution, sorted by input glyph index.
+    Multiple(Vec<(u16, Vec<u16>)>),
+    /// Many-to-one substitution. The input sequence includes the first glyph.
+    Ligature(Vec<(Vec<u16>, u16)>),
+    /// A lookup type this engine does not implement. Holds the GSUB lookup type number.
+    Unsupported(u16),
+}
+
+/// The maximum number of times a single glyph may be substituted before the font is considered
+/// to contain a recursive substitution cycle.
+const MAX_SUBSTITUTION_DEPTH: usize = 8;
+
+/// Maps a string to positioned-independent glyphs, applying the font's GSUB substitutions for
+/// the default ligature features. Each resulting glyph carries the byte range of the source
+/// text it was produced from. Text that triggers no substitution is mapped one-to-one, with
+/// each glyph covering exactly the bytes of its source character.
+pub fn layout_gsub(font: &Font, text: &str) -> Result<Vec<LayoutGlyph>, LayoutError> {
+    let mut glyphs = Vec::new();
+    let mut byte_offset = 0;
+    while byte_offset < text.len() {
+        let prev_byte_offset = byte_offset;
+        let character = read_utf8(text.as_bytes(), &mut byte_offset);
+        glyphs.push(LayoutGlyph {
+            glyph_index: font.lookup_glyph_index(character),
+            byte_range: prev_byte_offset..byte_offset,
+        });
+    }
+    apply_gsub(font.gsub_lookups(), &mut glyphs)?;
+    Ok(glyphs)
+}
+
+/// Applies GSUB lookups to a sequence of glyphs, merging byte ranges along substitution chains.
+/// The byte ranges of the sequence always remain continuous and non-overlapping:
+///
+/// * Ligatures (many-to-one) cover the union of the consumed glyphs' ranges.
+/// * Multiple substitutions (one-to-many) assign the source range to the first produced glyph
+///   and empty boundary ranges to the rest.
+/// * Single substitutions (one-to-one) keep the source range unchanged.
+pub(crate) fn apply_gsub(lookups: &[GsubLookup], glyphs: &mut Vec<LayoutGlyph>) -> Result<(), LayoutError> {
+    for lookup in lookups {
+        if let GsubLookup::Unsupported(kind) = lookup {
+            return Err(LayoutError::UnsupportedLookup(*kind));
+        }
+    }
+    if glyphs.is_empty() {
+        return Ok(());
+    }
+
+    // Tracks how many times the glyph at each position has been substituted. A glyph that is
+    // substituted too many times indicates a substitution cycle in the font.
+    let mut depths = vec![0usize; glyphs.len()];
+    loop {
+        let mut changed = false;
+        for lookup in lookups {
+            match lookup {
+                GsubLookup::Single(map) => {
+                    for (i, glyph) in glyphs.iter_mut().enumerate() {
+                        if let Ok(p) = map.binary_search_by_key(&glyph.glyph_index, |e| e.0) {
+                            if depths[i] >= MAX_SUBSTITUTION_DEPTH {
+                                return Err(LayoutError::RecursiveSubstitution);
+                            }
+                            glyph.glyph_index = map[p].1;
+                            depths[i] += 1;
+                            changed = true;
+                        }
+                    }
+                }
+                GsubLookup::Multiple(map) => {
+                    let mut i = 0;
+                    while i < glyphs.len() {
+                        if let Ok(p) = map.binary_search_by_key(&glyphs[i].glyph_index, |e| e.0) {
+                            let substitutes = &map[p].1;
+                            if !substitutes.is_empty() {
+                                if depths[i] >= MAX_SUBSTITUTION_DEPTH {
+                                    return Err(LayoutError::RecursiveSubstitution);
+                                }
+                                let end = glyphs[i].byte_range.end;
+                                let depth = depths[i] + 1;
+                                glyphs[i].glyph_index = substitutes[0];
+                                depths[i] = depth;
+                                for (j, &substitute) in substitutes[1..].iter().enumerate() {
+                                    glyphs.insert(
+                                        i + 1 + j,
+                                        LayoutGlyph {
+                                            glyph_index: substitute,
+                                            byte_range: end..end,
+                                        },
+                                    );
+                                    depths.insert(i + 1 + j, depth);
+                                }
+                                changed = true;
+                            }
+                        }
+                        i += 1;
+                    }
+                }
+                GsubLookup::Ligature(rules) => {
+                    let mut i = 0;
+                    while i < glyphs.len() {
+                        // Greedily match the longest ligature starting at this position.
+                        let mut best: Option<&(Vec<u16>, u16)> = None;
+                        for rule in rules {
+                            let sequence = &rule.0;
+                            if sequence.len() < 2 || i + sequence.len() > glyphs.len() {
+                                continue;
+                            }
+                            if let Some(b) = best {
+                                if sequence.len() <= b.0.len() {
+                                    continue;
+                                }
+                            }
+                            if sequence
+                                .iter()
+                                .enumerate()
+                                .all(|(k, &g)| glyphs[i + k].glyph_index == g)
+                            {
+                                best = Some(rule);
+                            }
+                        }
+                        if let Some(rule) = best {
+                            let len = rule.0.len();
+                            let depth = depths[i..i + len].iter().copied().max().unwrap_or(0);
+                            if depth >= MAX_SUBSTITUTION_DEPTH {
+                                return Err(LayoutError::RecursiveSubstitution);
+                            }
+                            let merged = LayoutGlyph {
+                                glyph_index: rule.1,
+                                byte_range: glyphs[i].byte_range.start..glyphs[i + len - 1].byte_range.end,
+                            };
+                            glyphs.splice(i..i + len, core::iter::once(merged));
+                            depths.splice(i..i + len, core::iter::once(depth + 1));
+                            changed = true;
+                        }
+                        i += 1;
+                    }
+                }
+                GsubLookup::Unsupported(_) => {}
+            }
+        }
+        if !changed {
+            return Ok(());
+        }
+    }
 }
 
 /// A style description for a segment of text.
@@ -563,5 +751,158 @@ impl<'a, U: Copy + Clone> Layout<U> {
     /// Gets the settings currently being used for layout.
     pub fn settings(&self) -> &LayoutSettings {
         &self.settings
+    }
+}
+
+#[cfg(test)]
+mod gsub_clusters {
+    use super::*;
+    use crate::FontSettings;
+
+    fn glyph(index: u16, start: usize, end: usize) -> LayoutGlyph {
+        LayoutGlyph {
+            glyph_index: index,
+            byte_range: start..end,
+        }
+    }
+
+    /// Asserts the byte ranges are sorted, non-overlapping, and cover `start..end` with no gaps.
+    fn assert_continuous_coverage(glyphs: &[LayoutGlyph], start: usize, end: usize) {
+        let mut cursor = start;
+        for g in glyphs {
+            assert!(g.byte_range.start <= g.byte_range.end, "inverted range: {:?}", g);
+            assert!(g.byte_range.end >= cursor, "overlap before {:?}", g);
+            if g.byte_range.end > cursor {
+                assert_eq!(g.byte_range.start, cursor, "gap before {:?}", g);
+                cursor = g.byte_range.end;
+            } else {
+                assert_eq!(g.byte_range.start, g.byte_range.end, "non-empty range regresses: {:?}", g);
+            }
+        }
+        assert_eq!(cursor, end, "ranges do not cover the full text");
+    }
+
+    #[test]
+    fn no_substitution_leaves_output_unchanged() {
+        let input = vec![glyph(10, 0, 1), glyph(11, 1, 2), glyph(12, 2, 4)];
+
+        let mut out = input.clone();
+        apply_gsub(&[], &mut out).unwrap();
+        assert_eq!(out, input);
+
+        // Lookups that match nothing must also leave every field unchanged.
+        let lookups = [
+            GsubLookup::Single(vec![(99, 100)]),
+            GsubLookup::Multiple(vec![(98, vec![1, 2])]),
+            GsubLookup::Ligature(vec![(vec![97, 96], 95)]),
+        ];
+        let mut out = input.clone();
+        apply_gsub(&lookups, &mut out).unwrap();
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn single_substitution_chain_preserves_byte_range() {
+        let lookups = [
+            GsubLookup::Single(vec![(10, 11)]),
+            GsubLookup::Single(vec![(11, 12)]),
+        ];
+        let mut glyphs = vec![glyph(10, 3, 7), glyph(5, 7, 8)];
+        apply_gsub(&lookups, &mut glyphs).unwrap();
+        assert_eq!(glyphs, vec![glyph(12, 3, 7), glyph(5, 7, 8)]);
+        assert_continuous_coverage(&glyphs, 3, 8);
+    }
+
+    #[test]
+    fn ligature_merges_byte_ranges() {
+        let lookups = [GsubLookup::Ligature(vec![(vec![10, 11, 12], 20)])];
+        let mut glyphs = vec![glyph(10, 0, 1), glyph(11, 1, 2), glyph(12, 2, 3), glyph(5, 3, 4)];
+        apply_gsub(&lookups, &mut glyphs).unwrap();
+        assert_eq!(glyphs, vec![glyph(20, 0, 3), glyph(5, 3, 4)]);
+        assert_continuous_coverage(&glyphs, 0, 4);
+    }
+
+    #[test]
+    fn ligature_prefers_longest_match() {
+        let lookups = [GsubLookup::Ligature(vec![
+            (vec![10, 11], 20),
+            (vec![10, 11, 12], 21),
+        ])];
+        let mut glyphs = vec![glyph(10, 0, 1), glyph(11, 1, 2), glyph(12, 2, 3)];
+        apply_gsub(&lookups, &mut glyphs).unwrap();
+        assert_eq!(glyphs, vec![glyph(21, 0, 3)]);
+    }
+
+    #[test]
+    fn multiple_substitution_keeps_coverage_continuous() {
+        let lookups = [GsubLookup::Multiple(vec![(10, vec![30, 31, 32])])];
+        let mut glyphs = vec![glyph(10, 0, 2), glyph(5, 2, 3)];
+        apply_gsub(&lookups, &mut glyphs).unwrap();
+        assert_eq!(
+            glyphs,
+            vec![glyph(30, 0, 2), glyph(31, 2, 2), glyph(32, 2, 2), glyph(5, 2, 3)]
+        );
+        assert_continuous_coverage(&glyphs, 0, 3);
+    }
+
+    #[test]
+    fn chained_multiple_then_ligature_merges_ranges() {
+        let lookups = [
+            GsubLookup::Multiple(vec![(10, vec![30, 31])]),
+            GsubLookup::Ligature(vec![(vec![31, 5], 40)]),
+        ];
+        let mut glyphs = vec![glyph(10, 0, 2), glyph(5, 2, 3)];
+        apply_gsub(&lookups, &mut glyphs).unwrap();
+        assert_eq!(glyphs, vec![glyph(30, 0, 2), glyph(40, 2, 3)]);
+        assert_continuous_coverage(&glyphs, 0, 3);
+    }
+
+    #[test]
+    fn unsupported_lookup_error_is_distinct() {
+        let lookups = [GsubLookup::Unsupported(6)];
+        let mut glyphs = vec![glyph(1, 0, 1)];
+        let err = apply_gsub(&lookups, &mut glyphs).unwrap_err();
+        assert!(matches!(err, LayoutError::UnsupportedLookup(6)));
+        assert!(!matches!(err, LayoutError::RecursiveSubstitution));
+    }
+
+    #[test]
+    fn recursive_substitution_error_is_distinct() {
+        // 1 -> 2 -> 1 -> ... cycles forever without a depth limit.
+        let lookups = [
+            GsubLookup::Single(vec![(1, 2)]),
+            GsubLookup::Single(vec![(2, 1)]),
+        ];
+        let mut glyphs = vec![glyph(1, 0, 1)];
+        let err = apply_gsub(&lookups, &mut glyphs).unwrap_err();
+        assert!(matches!(err, LayoutError::RecursiveSubstitution));
+        assert!(!matches!(err, LayoutError::UnsupportedLookup(_)));
+    }
+
+    #[test]
+    fn roboto_ligature_maps_back_to_source_range() {
+        let data = include_bytes!("../dev/resources/fonts/Roboto-Regular.ttf");
+        let font = Font::from_bytes(data as &[u8], FontSettings::default()).unwrap();
+
+        // "fi" forms a single ligature glyph covering both source bytes.
+        let glyphs = layout_gsub(&font, "fi").unwrap();
+        assert_eq!(glyphs.len(), 1);
+        assert_eq!(glyphs[0].byte_range, 0..2);
+        assert_ne!(glyphs[0].glyph_index, font.lookup_glyph_index('f'));
+        assert_ne!(glyphs[0].glyph_index, font.lookup_glyph_index('i'));
+
+        // Text without substitutions maps one-to-one, fields unchanged.
+        let glyphs = layout_gsub(&font, "ab").unwrap();
+        assert_eq!(glyphs.len(), 2);
+        assert_eq!(glyphs[0].glyph_index, font.lookup_glyph_index('a'));
+        assert_eq!(glyphs[0].byte_range, 0..1);
+        assert_eq!(glyphs[1].glyph_index, font.lookup_glyph_index('b'));
+        assert_eq!(glyphs[1].byte_range, 1..2);
+
+        // Multibyte characters map to their full UTF-8 byte range.
+        let glyphs = layout_gsub(&font, "aé").unwrap();
+        assert_eq!(glyphs.len(), 2);
+        assert_eq!(glyphs[0].byte_range, 0..1);
+        assert_eq!(glyphs[1].byte_range, 1..3);
     }
 }

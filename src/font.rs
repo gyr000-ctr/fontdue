@@ -1,4 +1,4 @@
-use crate::layout::GlyphRasterConfig;
+use crate::layout::{GlyphRasterConfig, GsubLookup};
 use crate::math::{Geometry, Line};
 use crate::platform::{as_i32, ceil, floor, fract, is_negative};
 use crate::raster::Raster;
@@ -194,6 +194,7 @@ pub struct Font {
     horizontal_line_metrics: Option<LineMetrics>,
     horizontal_kern: Option<HashMap<u32, i16>>,
     vertical_line_metrics: Option<LineMetrics>,
+    gsub_lookups: Vec<GsubLookup>,
     settings: FontSettings,
     hash: usize,
 }
@@ -235,6 +236,113 @@ fn convert_name(face: &Face) -> Option<String> {
         }
     }
     None
+}
+
+/// GSUB features applied by default during GSUB-aware layout.
+const GSUB_LAYOUT_FEATURES: &[Tag] = &[
+    Tag::from_bytes(b"liga"),
+    Tag::from_bytes(b"rlig"),
+    Tag::from_bytes(b"clig"),
+];
+
+/// Collects all glyph indices covered by a GSUB coverage table.
+fn gsub_coverage_glyphs(coverage: ttf_parser::opentype_layout::Coverage) -> Vec<u16> {
+    use ttf_parser::opentype_layout::Coverage;
+    match coverage {
+        Coverage::Format1 { glyphs } => glyphs.into_iter().map(|g| g.0).collect(),
+        Coverage::Format2 { records } => {
+            let mut out = Vec::new();
+            for record in records {
+                for id in record.start.0..=record.end.0 {
+                    out.push(id);
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Parses the GSUB lookups referenced by the default layout features into an owned form that the
+/// layout engine can apply. Lookup types the engine does not implement are preserved as
+/// `GsubLookup::Unsupported` so that layout can report them as `LayoutError::UnsupportedLookup`.
+fn parse_gsub_lookups(face: &Face) -> Vec<GsubLookup> {
+    use ttf_parser::gsub::{SingleSubstitution, SubstitutionSubtable};
+
+    let gsub = match face.tables().gsub {
+        Some(gsub) => gsub,
+        None => return Vec::new(),
+    };
+
+    // Collect the lookups referenced by the default features, deduplicated, in lookup list order.
+    let mut wanted: Vec<u16> = Vec::new();
+    for feature in gsub.features {
+        if GSUB_LAYOUT_FEATURES.contains(&feature.tag) {
+            for index in feature.lookup_indices {
+                if !wanted.contains(&index) {
+                    wanted.push(index);
+                }
+            }
+        }
+    }
+    wanted.sort_unstable();
+
+    let mut lookups = Vec::new();
+    for index in wanted {
+        let lookup = match gsub.lookups.get(index) {
+            Some(lookup) => lookup,
+            None => continue,
+        };
+        for subtable in lookup.subtables.into_iter::<SubstitutionSubtable>() {
+            match subtable {
+                SubstitutionSubtable::Single(ss) => {
+                    let mut map: Vec<(u16, u16)> = match ss {
+                        SingleSubstitution::Format1 { coverage, delta } => gsub_coverage_glyphs(coverage)
+                            .into_iter()
+                            .map(|g| (g, (g as i32 + delta as i32) as u16))
+                            .collect(),
+                        SingleSubstitution::Format2 { coverage, substitutes } => gsub_coverage_glyphs(coverage)
+                            .into_iter()
+                            .zip(substitutes.into_iter().map(|g| g.0))
+                            .collect(),
+                    };
+                    map.sort_unstable();
+                    lookups.push(GsubLookup::Single(map));
+                }
+                SubstitutionSubtable::Multiple(ms) => {
+                    let mut map: Vec<(u16, Vec<u16>)> = gsub_coverage_glyphs(ms.coverage)
+                        .into_iter()
+                        .zip(ms.sequences.into_iter().map(|seq| {
+                            seq.substitutes.into_iter().map(|g| g.0).collect()
+                        }))
+                        .collect();
+                    map.sort_unstable_by_key(|e| e.0);
+                    lookups.push(GsubLookup::Multiple(map));
+                }
+                SubstitutionSubtable::Ligature(ls) => {
+                    let mut rules: Vec<(Vec<u16>, u16)> = Vec::new();
+                    for (first, set) in gsub_coverage_glyphs(ls.coverage)
+                        .into_iter()
+                        .zip(ls.ligature_sets.into_iter())
+                    {
+                        for ligature in set {
+                            let mut input = Vec::with_capacity(ligature.components.len() as usize + 1);
+                            input.push(first);
+                            input.extend(ligature.components.into_iter().map(|g| g.0));
+                            rules.push((input, ligature.glyph.0));
+                        }
+                    }
+                    // Longest sequences first so the engine prefers the longest match.
+                    rules.sort_by(|a, b| b.0.len().cmp(&a.0.len()).then_with(|| a.0.cmp(&b.0)));
+                    lookups.push(GsubLookup::Ligature(rules));
+                }
+                SubstitutionSubtable::Alternate(_) => lookups.push(GsubLookup::Unsupported(3)),
+                SubstitutionSubtable::Context(_) => lookups.push(GsubLookup::Unsupported(5)),
+                SubstitutionSubtable::ChainContext(_) => lookups.push(GsubLookup::Unsupported(6)),
+                SubstitutionSubtable::ReverseChainSingle(_) => lookups.push(GsubLookup::Unsupported(8)),
+            }
+        }
+    }
+    lookups
 }
 
 impl Font {
@@ -280,6 +388,13 @@ impl Font {
         if settings.load_substitutions {
             load_gsub(&face, &mut indices_to_load);
         }
+
+        // Parse the GSUB lookups used by GSUB-aware layout into an owned form.
+        let gsub_lookups = if settings.load_substitutions {
+            parse_gsub_lookups(&face)
+        } else {
+            Vec::new()
+        };
 
         let units_per_em = face.units_per_em() as f32;
 
@@ -343,6 +458,7 @@ impl Font {
             horizontal_line_metrics,
             horizontal_kern,
             vertical_line_metrics,
+            gsub_lookups,
             settings,
             hash,
         })
@@ -642,5 +758,10 @@ impl Font {
     /// Gets the total glyphs in the font.
     pub fn glyph_count(&self) -> u16 {
         self.glyphs.len() as u16
+    }
+
+    /// Gets the parsed GSUB lookups used by GSUB-aware layout.
+    pub(crate) fn gsub_lookups(&self) -> &[GsubLookup] {
+        &self.gsub_lookups
     }
 }
